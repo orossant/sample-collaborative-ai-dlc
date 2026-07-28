@@ -195,6 +195,19 @@ export const commitAll = async ({
   // ensure the repo-local excludes before staging the tree.
   await ensureRuntimeExcludes({ dir });
 
+  // Every commit/merge below passes --no-verify, deliberately: the CLONED USER
+  // REPO's hooks are not ours to run. A repo with husky + lint-staged installs a
+  // pre-commit hook that shells out to npm/npx, but the runtime never installs
+  // the checkout's dependencies, so the hook exits non-zero and the commit fails
+  // with `git_commit_failed` — losing a stage's completed work for a reason that
+  // has nothing to do with that work. Observed in the wild as a commit_failed
+  // whose only detail was npm's "Unknown project config" warnings.
+  //
+  // Skipping them is correct, not merely expedient: the platform runs its OWN
+  // verification axes over this work (the deterministic sensors, the LLM
+  // reviewer, and the human gate), and the user's hooks still run normally for
+  // humans committing locally and in their CI on the pushed branch.
+
   const attemptOnce = async () => {
     const before = await git(['status', '--porcelain'], { cwd: dir });
     const files =
@@ -213,7 +226,9 @@ export const commitAll = async ({
     if (status.exitCode === 0 && status.stdout.trim() === '') {
       return { committed: false, reason: 'clean' };
     }
-    const commit = await git([...gitIdentity(author), 'commit', '-m', message], { cwd: dir });
+    const commit = await git([...gitIdentity(author), 'commit', '--no-verify', '-m', message], {
+      cwd: dir,
+    });
     if (commit.exitCode !== 0) {
       return { committed: false, reason: 'commit_failed', detail: commit.stderr.trim(), files };
     }
@@ -280,9 +295,12 @@ export const seedInitialCommit = async ({
   if (onBase.exitCode !== 0) {
     return { seeded: false, reason: 'base_checkout_failed', detail: onBase.stderr.trim() };
   }
-  const commit = await git([...gitIdentity(author), 'commit', '--allow-empty', '-m', message], {
-    cwd: dir,
-  });
+  const commit = await git(
+    [...gitIdentity(author), 'commit', '--no-verify', '--allow-empty', '-m', message],
+    {
+      cwd: dir,
+    },
+  );
   if (commit.exitCode !== 0) {
     return { seeded: false, reason: 'commit_failed', detail: commit.stderr.trim() };
   }
@@ -699,6 +717,7 @@ export const mergeBranchNoFf = async ({
     [
       ...gitIdentity(author),
       'merge',
+      '--no-verify',
       '--no-ff',
       '-m',
       message,
@@ -785,6 +804,7 @@ export const beginConflictMerge = async ({
     [
       ...gitIdentity(author),
       'merge',
+      '--no-verify',
       '--no-ff',
       '-m',
       message,
@@ -880,7 +900,9 @@ export const concludeConflictMerge = async ({
     }
     // `git commit` with no -m completes the merge using MERGE_MSG (the message
     // beginConflictMerge supplied via -m).
-    const commit = await git([...gitIdentity(author), 'commit', '--no-edit'], { cwd: dir });
+    const commit = await git([...gitIdentity(author), 'commit', '--no-verify', '--no-edit'], {
+      cwd: dir,
+    });
     if (commit.exitCode !== 0) {
       await abort();
       return { concluded: false, reason: 'commit_failed', detail: commit.stderr.trim() };

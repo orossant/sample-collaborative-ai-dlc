@@ -153,6 +153,43 @@ describe('commitAll', () => {
     expect(show.stdout).toContain('new.txt');
     expect(show.stdout).toContain('README.md');
   });
+
+  it("commits despite a FAILING pre-commit hook in the user's repo", async () => {
+    // Regression: a cloned repo with husky/lint-staged installs a pre-commit
+    // hook that shells out to npm. The runtime never installs the checkout's
+    // dependencies, so the hook exits non-zero, `git commit` fails, and a stage
+    // that had already produced its artifacts died with git_commit_failed —
+    // observed in the wild with only npm "Unknown project config" warnings as
+    // the detail. The engine must not run the user repo's hooks.
+    const { work } = await initRemoteAndClone();
+    const hook = path.join(work, '.git', 'hooks', 'pre-commit');
+    await writeFile(hook, '#!/bin/sh\necho "npm warn Unknown project config" >&2\nexit 1\n', {
+      mode: 0o755,
+    });
+    await writeFile(path.join(work, 'agent-work.txt'), 'artifacts the agent produced\n');
+
+    const res = await commitAll({ dir: work, message: 'aidlc(functional-design): e1' });
+
+    expect(res.committed).toBe(true);
+    expect(res.sha).toMatch(/^[0-9a-f]{40}$/);
+    const show = await git(['show', '--stat', '--format='], work);
+    expect(show.stdout).toContain('agent-work.txt');
+  });
+
+  it("commits despite a FAILING commit-msg hook in the user's repo", async () => {
+    // --no-verify must cover commit-msg too (e.g. commitlint rejecting the
+    // engine's `aidlc(stage): <executionId>` subject), not just pre-commit.
+    const { work } = await initRemoteAndClone();
+    const hook = path.join(work, '.git', 'hooks', 'commit-msg');
+    await writeFile(hook, '#!/bin/sh\necho "subject does not match convention" >&2\nexit 1\n', {
+      mode: 0o755,
+    });
+    await writeFile(path.join(work, 'agent-work.txt'), 'work\n');
+
+    const res = await commitAll({ dir: work, message: 'aidlc(functional-design): e1' });
+
+    expect(res.committed).toBe(true);
+  });
 });
 
 describe('seedInitialCommit', () => {
