@@ -5,6 +5,7 @@ import {
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  TOOL_UNAVAILABLE_EXIT,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -78,6 +79,14 @@ describe('resultFromExit', () => {
     expect(resultFromExit(2)).toBe(SENSOR_RESULT.INCONCLUSIVE);
     expect(resultFromExit(1)).toBe(SENSOR_RESULT.FAIL);
     expect(resultFromExit(null)).toBe(SENSOR_RESULT.BLOCKED);
+  });
+
+  it('treats 127 (tool unresolvable) as INCONCLUSIVE, never FAIL', () => {
+    // The per-sensor scripts exit 127 when their underlying tool cannot be
+    // resolved. Reporting that as FAIL made a broken harness look identical to
+    // real type/lint errors — and would wedge a blocking sensor.
+    expect(resultFromExit(TOOL_UNAVAILABLE_EXIT)).toBe(SENSOR_RESULT.INCONCLUSIVE);
+    expect(TOOL_UNAVAILABLE_EXIT).toBe(127);
   });
 });
 

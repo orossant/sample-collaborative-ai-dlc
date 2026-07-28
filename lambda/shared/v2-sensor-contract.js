@@ -107,13 +107,26 @@ const validateScriptSpec = (sensor) => {
   };
 };
 
+// The upstream per-sensor scripts reserve 127 for "the underlying tool could not
+// be resolved" — they probe (e.g. `bunx tsc --version`) at startup and exit 127
+// on ANY non-zero probe, because `bunx` returns assorted non-127 codes for
+// network-fetch / package-resolution / registry-timeout failures. Upstream a
+// dispatcher branch reclassified this to a tool-unavailable note; we own that
+// reclassification here instead.
+const TOOL_UNAVAILABLE_EXIT = 127;
+
 // Map a script's exit code to a result. Convention (matches upstream per-sensor
 // scripts): 0 → PASS/FAIL is decided by the script's stdout JSON `pass` field;
 // the runner reads that. When stdout JSON is unavailable we fall back to the
-// exit code alone: 0 PASS, 2 INCONCLUSIVE, null BLOCKED, else FAIL.
+// exit code alone: 0 PASS, 2 INCONCLUSIVE, 127 INCONCLUSIVE (tool unavailable,
+// NOT a code defect), null BLOCKED, else FAIL.
 const resultFromExit = (exitCode) => {
   if (exitCode === 0) return SENSOR_RESULT.PASS;
   if (exitCode === 2) return SENSOR_RESULT.INCONCLUSIVE;
+  // A missing/unresolvable tool is "ran but couldn't decide", never a FAIL — an
+  // advisory tool-unavailable reported as FAIL is indistinguishable from real
+  // type/lint errors, and a BLOCKING one would wedge the stage.
+  if (exitCode === TOOL_UNAVAILABLE_EXIT) return SENSOR_RESULT.INCONCLUSIVE;
   if (exitCode === null || exitCode === undefined) return SENSOR_RESULT.BLOCKED;
   return SENSOR_RESULT.FAIL;
 };
@@ -446,6 +459,7 @@ export {
   ALLOWED_SCRIPT_RUNTIMES,
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
+  TOOL_UNAVAILABLE_EXIT,
   GRAPH_SENSORS,
   sensorKind,
   severityGate,
@@ -463,6 +477,7 @@ export default {
   ALLOWED_SCRIPT_RUNTIMES,
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
+  TOOL_UNAVAILABLE_EXIT,
   GRAPH_SENSORS,
   sensorKind,
   severityGate,

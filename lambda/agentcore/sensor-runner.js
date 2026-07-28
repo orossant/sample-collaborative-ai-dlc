@@ -33,6 +33,7 @@ import {
   evalRequiredSections,
   evalUpstreamCoverage,
   evalGraphCoverage,
+  TOOL_UNAVAILABLE_EXIT,
 } from '../shared/v2-sensor-contract.js';
 
 // Convert a sensor `matches` glob (e.g. `**/*.{ts,tsx}`, `**/aidlc-docs/**`)
@@ -113,7 +114,31 @@ const listFiles = async (root, { cap = 5000 } = {}) => {
   return out;
 };
 
-// Spawn a child and collect stdout/stderr + exit, enforcing a hard timeout.
+// Narrow a globbed workspace file list to the files THIS stage actually changed.
+//
+// Why this exists: `listFiles` walks the whole checkout, so a stage that writes
+// only methodology artifacts (which live in Neptune, not on disk) was still
+// matching source files left behind by an EARLIER code stage — and then being
+// judged on code it never touched. A design stage would spawn the type-checker
+// once per pre-existing `.ts` file in the repo.
+//
+// `changed` comes from the git engine's own `status --porcelain` capture, taken
+// before it staged the tree (see git-engine.js#commitAll). Contract:
+//   null / not an array → UNKNOWN provenance; do not scope (check everything).
+//                          Never silently skip checks when we can't tell.
+//   []                   → the stage changed nothing on disk; nothing to check.
+//
+// Matching is suffix-tolerant because the engine reports paths relative to each
+// REPO dir while `listFiles` reports them relative to the WORKSPACE root; on a
+// multi-repo checkout the repo dir is nested under the workspace. Erring toward
+// a suffix match includes a borderline file rather than skipping it.
+const scopeToChangedFiles = (files, changed) => {
+  if (!Array.isArray(changed)) return files;
+  if (changed.length === 0) return [];
+  const exact = new Set(changed);
+  return files.filter((f) => exact.has(f) || changed.some((c) => f.endsWith(`/${c}`)));
+};
+
 // Never rejects on a non-zero exit (a failing sensor is data, not an error).
 // `spawnFn` injectable for tests.
 const runChild = ({ file, args, timeoutMs, cwd, env, spawnFn = spawn }) =>
@@ -153,10 +178,39 @@ const runChild = ({ file, args, timeoutMs, cwd, env, spawnFn = spawn }) =>
     child.on('close', (code) => finish(code));
   });
 
+// Per-file stderr budget in a SensorRun `detail`. A script sensor fans out over
+// every matching file, so the row carries one entry per file — keep each
+// diagnostic short enough that a wide match (hundreds of files) cannot approach
+// the DynamoDB item ceiling. Truncated from the TAIL: the interpreter's actual
+// error is the last thing written, not the banner.
+const STDERR_BUDGET = 500;
+
+const tailDiagnostic = (stderr) => {
+  const text = typeof stderr === 'string' ? stderr.trim() : '';
+  if (!text) return null;
+  if (text.length <= STDERR_BUDGET) return text;
+  return `…${text.slice(-STDERR_BUDGET)}`;
+};
+
+// Runtimes whose sensors carry the verdict in stdout JSON at exit 0 (the
+// upstream per-sensor script contract). For these, a NON-ZERO exit is by
+// definition a script/tool error and NEVER a code-quality verdict: a genuine
+// lint/type defect exits 0 with `{"pass": false}`. `sh` is excluded — a shell
+// sensor legitimately signals failure through its exit status.
+const STDOUT_VERDICT_RUNTIMES = new Set(['bun', 'node']);
+
 // Read a sensor's stdout JSON `pass` field if present; falls back to the exit
 // code. Upstream per-sensor scripts exit 0 and carry the verdict in stdout
 // `{"pass": bool, ...}`, so the exit code alone under-reports a clean FAIL.
-const resultFromScript = ({ exitCode, stdout }) => {
+//
+// When there is NO stdout verdict we must not silently call it a FAIL. The
+// script contract reserves 127 for tool-unavailable, 1 for "no tsconfig / file
+// missing", and propagates the tool's own code for a config-load failure that
+// produced zero parsed diagnostics. All of those mean "the check did not run",
+// which is INCONCLUSIVE — reporting them as FAIL makes a broken harness
+// indistinguishable from real defects. `exitCode`/`stderr` are retained in the
+// detail so the next occurrence is diagnosable from the persisted row alone.
+const resultFromScript = ({ exitCode, stdout, stderr = '', runtime } = {}) => {
   if (exitCode === 0 && typeof stdout === 'string' && stdout.trim()) {
     try {
       const parsed = JSON.parse(stdout.trim().split(/\r?\n/).at(-1));
@@ -170,7 +224,26 @@ const resultFromScript = ({ exitCode, stdout }) => {
       /* not JSON — fall through to exit-code mapping */
     }
   }
-  return { result: resultFromExit(exitCode), detail: null };
+
+  const diagnostic = tailDiagnostic(stderr);
+  const ranButUndecided = (reason) => ({
+    result: SENSOR_RESULT.INCONCLUSIVE,
+    detail: { reason, exitCode: exitCode ?? null, stderr: diagnostic },
+  });
+
+  if (exitCode === TOOL_UNAVAILABLE_EXIT) return ranButUndecided('tool-unavailable');
+
+  const nonZero = exitCode !== 0 && exitCode !== 2 && exitCode !== null && exitCode !== undefined;
+  if (nonZero && STDOUT_VERDICT_RUNTIMES.has(runtime)) {
+    // Exited non-zero without emitting a verdict: the script itself failed
+    // (missing tsconfig, unreadable file, config-load error), not the code.
+    return ranButUndecided('script-error');
+  }
+
+  return {
+    result: resultFromExit(exitCode),
+    detail: exitCode === 0 ? null : { exitCode: exitCode ?? null, stderr: diagnostic },
+  };
 };
 
 // Create the sensor runner. `graph` is the graph-writer (for reading produced
@@ -184,6 +257,9 @@ export const createSensorRunner = ({
   substitutions = {},
   spawnFn = spawn,
   childEnv = process.env,
+  // Workspace-relative paths this stage changed on disk, from the git engine.
+  // null → unknown, fall back to inspecting the whole checkout.
+  changedFiles = null,
 } = {}) => {
   // Evaluate one `graph` sensor against the artifacts this stage produced. Each
   // produced artifact's content is read from Neptune and fed to the in-process
@@ -261,11 +337,26 @@ export const createSensorRunner = ({
     }
     const matcher = sensor.matches ? globToRegExp(sensor.matches) : null;
     const all = await listFiles(workspaceDir);
-    const matched = matcher ? all.filter((f) => matcher.test(f)) : all;
-    if (matched.length === 0) {
+    const globbed = matcher ? all.filter((f) => matcher.test(f)) : all;
+    if (globbed.length === 0) {
       return {
         result: SENSOR_RESULT.INCONCLUSIVE,
         detail: { reason: 'no files match', matches: sensor.matches ?? null },
+      };
+    }
+    // Only inspect what this stage changed. A design stage that produced no
+    // on-disk work is INCONCLUSIVE here rather than being graded on a previous
+    // stage's source files.
+    const matched = scopeToChangedFiles(globbed, changedFiles);
+    if (matched.length === 0) {
+      return {
+        result: SENSOR_RESULT.INCONCLUSIVE,
+        detail: {
+          reason: 'no changed files match',
+          matches: sensor.matches ?? null,
+          globbed: globbed.length,
+          changed: Array.isArray(changedFiles) ? changedFiles.length : null,
+        },
       };
     }
 
@@ -293,11 +384,28 @@ export const createSensorRunner = ({
         env: childEnv,
         spawnFn,
       });
-      const { result, detail } = resultFromScript(run);
-      fileResults.push({ file: rel, result, timedOut: run.timedOut, detail });
+      const { result, detail } = resultFromScript({ ...run, runtime: spec.runtime });
+      // Retain exitCode + tail-truncated stderr on every non-PASS entry. Without
+      // them a verdict is undiagnosable after the fact: the container is gone and
+      // the SensorRun row is the only record of why the check did not pass.
+      fileResults.push({
+        file: rel,
+        result,
+        timedOut: run.timedOut,
+        detail,
+        ...(result === SENSOR_RESULT.PASS
+          ? {}
+          : { exitCode: run.exitCode ?? null, stderr: tailDiagnostic(run.stderr) }),
+      });
       if (result === SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.FAIL;
       else if (result === SENSOR_RESULT.BLOCKED && worst !== SENSOR_RESULT.FAIL)
         worst = SENSOR_RESULT.BLOCKED;
+      else if (
+        result === SENSOR_RESULT.INCONCLUSIVE &&
+        worst !== SENSOR_RESULT.FAIL &&
+        worst !== SENSOR_RESULT.BLOCKED
+      )
+        worst = SENSOR_RESULT.INCONCLUSIVE;
     }
     return { result: worst, detail: { files: fileResults } };
   };
@@ -348,4 +456,10 @@ export const createSensorRunner = ({
   return { runStageSensors, runGraphSensor, runScriptSensor };
 };
 
-export const __test = { globToRegExp, listFiles, resultFromScript };
+export const __test = {
+  globToRegExp,
+  listFiles,
+  resultFromScript,
+  tailDiagnostic,
+  scopeToChangedFiles,
+};
